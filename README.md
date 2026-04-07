@@ -4,7 +4,7 @@ A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) hook that automa
 
 Every time a Claude Code session ends, this hook analyzes the transcript and **incrementally** updates knowledge files:
 
-- **`CLAUDE.md`** -- Instructions and rules (things to DO/AVOID, credentials, workflow conventions)
+- **`.claude/rules/<topic>.md`** -- Scoped instructions with optional path filters (things to DO/AVOID, workflow rules)
 - **`Context-<Folder>.md`** -- Project context placed in the folder where work happened (e.g., `Context-DB.md` in `DB/`)
 
 These files are loaded by Claude Code on subsequent sessions, giving it persistent memory across conversations.
@@ -24,20 +24,43 @@ Python script parses transcript (JSONL)
     |  - Detects primary working folder from file paths
     |
     v
+Reads existing .claude/rules/*.md files
+    |  - Parses frontmatter (description, path scope)
+    |  - Sends full content to LLM so it can update existing files
+    |
+    v
 Calls `claude -p --model sonnet` with incremental extraction prompt
     |  - Uses your existing Claude Code subscription
-    |  - Returns: additions, corrections, removals (NOT full rewrite)
+    |  - Returns: rules updates + context additions/corrections/removals
     |  - Checks existing context for staleness
     |
     v
-Applies incremental changes
-    |-- CLAUDE.md: preserves manual content above marker, updates auto-extracted section
+Applies changes
+    |-- .claude/rules/<topic>.md: creates or updates scoped rules files
     |-- Context-<Folder>.md: appends new facts, corrects wrong facts, removes stale facts
 ```
 
 ## Key Design Decisions
 
-### Incremental, Not Full Rewrite
+### Rules Files, Not CLAUDE.md
+
+Instructions go to **`.claude/rules/<topic>.md`** files with optional path scoping, not to CLAUDE.md. This keeps CLAUDE.md manual-only and prevents it from growing unboundedly.
+
+Each rules file has YAML frontmatter:
+
+```markdown
+---
+description: "Google Workspace CLI rules"
+paths:
+  - "ProgramManagement/**"
+---
+- When uploading large CSVs to Sheets, batch writes in ~500-row chunks
+- When gws returns 401, check credentials.json path
+```
+
+Claude Code loads rules files based on their `paths` scope — rules with `paths: ["Trashformers/**"]` only load when working in that folder. Rules without `paths` are global.
+
+### Incremental Updates
 
 The extractor **never rewrites** the entire context file. Instead, it produces a diff:
 
@@ -47,7 +70,7 @@ The extractor **never rewrites** the entire context file. Instead, it produces a
 | **Corrections** | Wrong facts are found by exact text match and replaced |
 | **Removals** | Stale facts are found by exact text match and deleted |
 
-This means your manually curated context is preserved. Only genuinely new, wrong, or stale information is touched.
+For rules files, the LLM returns the **full updated content** of each changed file (since rules files are small and atomic replacement is simpler than patching).
 
 ### Folder-Level Context Files
 
@@ -55,13 +78,18 @@ Context files are placed **where the work happened**, not always at the project 
 
 ```
 WorkingDirectory/
-├── CLAUDE.md                    (instructions — always at root)
+├── .claude/
+│   └── rules/
+│       ├── git-repo.md              (global — git workflow rules)
+│       ├── gws.md                   (global — Google Workspace rules)
+│       ├── pgm.md                   (scoped to ProgramManagement/**)
+│       ├── trashformers.md          (scoped to Trashformers/**)
+│       └── slides-design.md         (scoped to PPTattempt/**)
 ├── DB/
-│   └── Context-DB.md            (context for DB work)
-├── goa-collections/
-│   └── Context-goa-collections.md
-└── OrgPlan/
-    └── Context-OrgPlan.md
+│   └── Context-DB.md                (context for DB work)
+├── Trashformers/
+│   └── Context-Trashformers.md
+└── CLAUDE.md                        (manual content only)
 ```
 
 The primary folder is detected from file paths in the transcript. The LLM can also override the detection if it has a stronger signal.
@@ -78,6 +106,7 @@ Each extraction includes a relevance check — the LLM reviews existing context 
 - **Non-blocking** -- Shell wrapper runs Python script in the background; hook returns immediately
 - **Conservative changes** -- Only modifies context when there's clear evidence from the transcript
 - **Graceful degradation** -- Silently skips on any error (never breaks your session)
+- **Existing rules awareness** -- Reads all existing rules files before calling the LLM, so it appends to existing files rather than creating duplicates
 
 ## Prerequisites
 
@@ -143,18 +172,24 @@ Edit the constants at the top of `knowledge-extractor.py`:
 
 ## Output Files
 
-### CLAUDE.md
+### .claude/rules/\<topic\>.md
 
-Unchanged from v1. Appends auto-extracted section below a marker:
+Scoped instruction files with YAML frontmatter. Created or updated automatically:
 
 ```markdown
-# Your Manual Content
-(anything above the marker is preserved)
-
-<!-- Auto-extracted knowledge -->
-- Always run tests before committing
-- Use Python 3.11+ for this project
+---
+description: "Program Management rules"
+paths:
+  - "ProgramManagement/**"
+---
+- When running /pgm, Phase 0 must always run first
+- PGM uses a sprint debt model, not carry-over
 ```
+
+The extractor reads all existing rules files before each run, so it will:
+- **Append** new instructions to an existing file if the topic matches
+- **Create** a new file only if the instruction covers a genuinely new topic
+- **Remove duplicates** and resolve contradictions (new instruction wins)
 
 ### Context-\<Folder\>.md
 
@@ -167,6 +202,16 @@ The API gateway is Kong running on AWS EKS...
 ## Business Rules
 GCP is embedded in GTIN, no direct GSTIN mapping...
 ```
+
+## Migrating from v1 (CLAUDE.md auto-section)
+
+If you were using the previous version that wrote to CLAUDE.md:
+
+1. **Split your auto-extracted instructions** into `.claude/rules/` files by topic
+2. **Remove the auto-extracted section** from CLAUDE.md (everything below `<!-- Auto-extracted knowledge -->`)
+3. **Update the hook** by pulling the latest version or running `./install.sh` again
+
+The new version will not touch CLAUDE.md — it only reads/writes `.claude/rules/` files.
 
 ## Logs and Debugging
 

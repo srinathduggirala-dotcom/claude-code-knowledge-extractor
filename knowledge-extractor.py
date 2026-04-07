@@ -4,15 +4,16 @@ Knowledge Extractor — Stop hook for Claude Code.
 
 Parses the session transcript, pipes it to `claude -p --model <model>` to extract
 knowledge INCREMENTALLY, then applies targeted edits to:
-  - CLAUDE.md  (instructions: things to DO/AVOID, credentials, workflow rules)
+  - .claude/rules/<topic>.md  (scoped instructions with YAML frontmatter path filters)
   - Context-<Folder>.md (project context placed in the primary working folder)
 
 Key behaviors:
   - INCREMENTAL: Only adds new facts, corrects wrong facts, removes stale facts.
     Never rewrites the entire context file.
+  - RULES-BASED: Instructions go to .claude/rules/ files with optional path scoping,
+    NOT to CLAUDE.md (which stays manual-only).
   - FOLDER-LEVEL: Detects the primary working folder from file paths in the
     transcript and places the context file there (e.g., Context-DB.md in DB/).
-  - RELEVANCE CHECK: Each session, flags stale/outdated context for removal.
 
 Uses the user's existing Claude Code subscription via `claude -p`.
 No separate API key required.
@@ -37,7 +38,6 @@ MIN_MEANINGFUL_CHARS = 200        # Min transcript length to trigger extraction
 DEBOUNCE_SECONDS = 300            # Cooldown between extractions (5 minutes)
 DEBOUNCE_MIN_MESSAGES = 10        # Min new messages to bypass debounce
 LOCK_STALE_SECONDS = 180          # Lock timeout (3 minutes)
-AUTO_MARKER = "<!-- Auto-extracted knowledge -->"
 
 # ---------------------------------------------------------------------------
 # Locate claude CLI
@@ -229,25 +229,18 @@ def detect_primary_folder(transcript: str, project_root: str) -> str:
     had the most activity. Returns the subfolder name (e.g., "DB")
     or "" if activity was at the root.
     """
-    # Match file paths that start with the project root
     root = project_root.rstrip("/")
-    # Find all absolute paths in the transcript
     path_pattern = re.compile(re.escape(root) + r'/([^/\s"\'<>]+)')
     matches = path_pattern.findall(transcript)
 
     if not matches:
         return ""
 
-    # Count subfolder mentions (exclude files at root — those have a dot)
     folder_counts = {}
     for match in matches:
-        # If it looks like a directory (no extension, or known dir names)
-        # Just count the first path component
         folder = match.split("/")[0] if "/" in match else match
-        # Skip if it's clearly a file at root level (has extension)
         if "." in folder and not folder.startswith("."):
             continue
-        # Skip hidden directories
         if folder.startswith("."):
             continue
         folder_counts[folder] = folder_counts.get(folder, 0) + 1
@@ -255,10 +248,8 @@ def detect_primary_folder(transcript: str, project_root: str) -> str:
     if not folder_counts:
         return ""
 
-    # Return the most mentioned folder
     primary = max(folder_counts, key=folder_counts.get)
 
-    # Verify it actually exists as a directory
     candidate = Path(root) / primary
     if candidate.is_dir():
         return primary
@@ -275,6 +266,87 @@ def find_context_file(project_dir: Path, folder_name: str) -> Path:
     if folder_name:
         return project_dir / folder_name / f"Context-{folder_name}.md"
     return project_dir / "context.md"
+
+
+# ---------------------------------------------------------------------------
+# Rules file helpers
+# ---------------------------------------------------------------------------
+
+def rules_dir(project_dir: Path) -> Path:
+    return project_dir / ".claude" / "rules"
+
+
+def read_existing_rules(project_dir: Path) -> dict:
+    """
+    Read all existing .claude/rules/*.md files.
+    Returns {filename_without_ext: {"path": Path, "content": str, "description": str, "paths": list}}
+    """
+    rd = rules_dir(project_dir)
+    rules = {}
+    if not rd.is_dir():
+        return rules
+
+    for f in rd.iterdir():
+        if f.suffix == ".md" and f.name != "Icon":
+            content = read_file(f)
+            name = f.stem  # e.g., "pgm", "gws", "trashformers"
+            # Parse frontmatter for description and paths
+            desc = ""
+            paths = []
+            if content.startswith("---"):
+                parts = content.split("---", 2)
+                if len(parts) >= 3:
+                    fm = parts[1]
+                    for line in fm.strip().splitlines():
+                        line = line.strip()
+                        if line.startswith("description:"):
+                            desc = line.split(":", 1)[1].strip().strip('"').strip("'")
+                        if line.startswith("- "):
+                            # path entry under paths:
+                            paths.append(line[2:].strip().strip('"').strip("'"))
+            rules[name] = {
+                "path": f,
+                "content": content,
+                "description": desc,
+                "paths": paths,
+            }
+    return rules
+
+
+def build_rules_summary(rules: dict) -> str:
+    """Build a summary of existing rules files for the LLM prompt."""
+    if not rules:
+        return "(no rules files yet)"
+
+    lines = []
+    for name, info in sorted(rules.items()):
+        desc = info["description"] or "(no description)"
+        path_scope = ", ".join(info["paths"]) if info["paths"] else "(global)"
+        # Count instruction lines (lines starting with "- ")
+        instruction_count = sum(1 for l in info["content"].splitlines() if l.strip().startswith("- "))
+        lines.append(f"  - {name}.md: {desc} | scope: {path_scope} | {instruction_count} instructions")
+    return "\n".join(lines)
+
+
+def write_rules_file(project_dir: Path, name: str, description: str,
+                     path_scope: list, instructions: str, mem: Path):
+    """Write or update a .claude/rules/<name>.md file."""
+    rd = rules_dir(project_dir)
+    rd.mkdir(parents=True, exist_ok=True)
+    target = rd / f"{name}.md"
+
+    # Build frontmatter
+    fm_lines = ["---"]
+    fm_lines.append(f'description: "{description}"')
+    if path_scope:
+        fm_lines.append("paths:")
+        for p in path_scope:
+            fm_lines.append(f'  - "{p}"')
+    fm_lines.append("---")
+
+    content = "\n".join(fm_lines) + "\n" + instructions.strip() + "\n"
+    atomic_write(target, content)
+    log(mem, f"Updated rules file: .claude/rules/{name}.md ({len(instructions.splitlines())} lines)")
 
 
 # ---------------------------------------------------------------------------
@@ -314,26 +386,6 @@ def atomic_write(path: Path, content: str):
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md merge logic (unchanged — already incremental)
-# ---------------------------------------------------------------------------
-
-def merge_claude_md(existing: str, new_auto_section: str) -> str:
-    """
-    Preserve everything above the AUTO_MARKER in existing CLAUDE.md.
-    Replace the auto-extracted section below the marker.
-    """
-    if AUTO_MARKER in existing:
-        manual_part = existing.split(AUTO_MARKER)[0].rstrip()
-    else:
-        manual_part = existing.rstrip()
-
-    if not new_auto_section.strip():
-        return existing
-
-    return f"{manual_part}\n\n{AUTO_MARKER}\n{new_auto_section.strip()}\n"
-
-
-# ---------------------------------------------------------------------------
 # Incremental context merge
 # ---------------------------------------------------------------------------
 
@@ -358,12 +410,11 @@ def apply_incremental_changes(existing: str, additions: str, corrections: list, 
         removal = removal.strip()
         if not removal:
             continue
-        # Try to remove the line containing this text
         lines = result.split("\n")
         new_lines = []
         for line in lines:
             if removal in line:
-                continue  # skip this line
+                continue
             new_lines.append(line)
         result = "\n".join(new_lines)
 
@@ -386,53 +437,58 @@ def apply_incremental_changes(existing: str, additions: str, corrections: list, 
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = r"""You are a knowledge extraction specialist analyzing a Claude Code conversation transcript.
-Your job: extract NEW knowledge and produce INCREMENTAL updates to the existing context file.
+Your job: extract NEW knowledge and produce INCREMENTAL updates.
 
-CRITICAL RULES — READ CAREFULLY:
-1. You are NOT rewriting the context file. You are producing a DIFF.
-2. The existing context is the source of truth. Only change what needs changing.
-3. "additions" = genuinely NEW facts not already in the existing context.
-4. "corrections" = facts in the existing context that are PROVABLY WRONG based on this transcript.
-5. "removals" = facts in the existing context that are STALE or CONTRADICTED by this transcript.
-6. If the transcript doesn't reveal anything new, return empty additions/corrections/removals.
-7. Be conservative. When in doubt, don't change existing content.
+You produce TWO types of output:
 
-OUTPUT 1 — claude_md (Instructions):
-Things the AI assistant should DO or AVOID. Includes:
-- Workflow rules, credentials, coding standards, behavioral directives
-Format: imperative voice. "- Always X", "- Never Y"
-IMPORTANT: Merge with previously extracted instructions (provided below).
-Remove exact duplicates. If a new instruction contradicts an old one, keep the new one.
+OUTPUT 1 — rules (Instructions for .claude/rules/ files):
+Things the AI assistant should DO or AVOID. These go into SCOPED rules files
+in .claude/rules/<topic>.md with optional path filters.
+
+Each rules file has:
+  - A short kebab-case name (e.g., "pgm", "gws", "trashformers", "vis-analysis")
+  - A one-line description
+  - Optional path scope (glob patterns like "Trashformers/**" or "ProgramManagement/**")
+  - Instruction lines in imperative voice: "- Always X", "- Never Y"
+
+CRITICAL RULES for rules output:
+  - Check the existing rules files listed below. If the new instruction fits an
+    EXISTING file, add it there (return that file's name). Do NOT create a new file
+    for something that already has a file.
+  - If the instruction is genuinely new topic, create a new file.
+  - Return the FULL updated content of the rules file (all instructions, not just new ones)
+    because rules files are replaced atomically.
+  - Remove exact duplicates. If a new instruction contradicts an old one, keep the new one.
+  - If no new instructions were learned, return an empty rules array.
 
 OUTPUT 2 — context changes (Incremental):
-- "primary_folder": Which subfolder had the most activity in this session?
-  Determine from file paths mentioned in the transcript. Return just the folder
-  name (e.g., "DB", "goa-collections", "OrgPlan"). Return "" if activity was
-  at the project root or spread evenly.
-- "additions": New markdown content to APPEND to the context file.
-  Must be formatted with ## headers. Only genuinely new facts.
-- "corrections": List of {find, replace} pairs where existing text is wrong.
-  "find" must be an EXACT substring from the existing context.
-  "replace" is what it should be changed to.
-- "removals": List of exact lines/phrases from existing context that are stale
-  or no longer accurate. Only remove if the transcript PROVES it wrong.
-- "relevance_notes": Brief note on what you checked for staleness.
-
-RELEVANCE CHECK:
-Review the existing context against what you learned in this transcript.
-Flag anything that appears outdated or contradicted. Be specific in relevance_notes.
+Same as before — additions/corrections/removals for the Context-<Folder>.md file.
 
 RULES:
 - Only extract CONFIRMED knowledge (stated by user or verified by actions)
 - Only extract REUSABLE knowledge (skip one-off debugging details)
 - Be CONSERVATIVE with corrections and removals — only when clearly wrong
-- "additions" should NOT duplicate what's already in the existing context
 - Be concise but thorough"""
 
 
-def call_claude(transcript: str, existing_auto: str, existing_context: str,
-                context_file_name: str, mem: Path) -> dict:
+def call_claude(transcript: str, rules_summary: str, existing_rules: dict,
+                existing_context: str, context_file_name: str, mem: Path) -> dict:
     """Call claude -p with the extraction prompt, return parsed JSON."""
+
+    # Build detailed existing rules content for the LLM
+    rules_detail = ""
+    for name, info in sorted(existing_rules.items()):
+        # Extract just the instruction lines (after frontmatter)
+        content = info["content"]
+        if "---" in content:
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                instructions_part = parts[2].strip()
+            else:
+                instructions_part = content
+        else:
+            instructions_part = content
+        rules_detail += f"\n### {name}.md (scope: {', '.join(info['paths']) or 'global'})\n{instructions_part}\n"
 
     user_prompt = f"""{SYSTEM_PROMPT}
 
@@ -444,10 +500,13 @@ Here is the conversation transcript from a Claude Code session:
 {transcript}
 </transcript>
 
-Here are the previously extracted instructions (auto-extracted section of CLAUDE.md):
-<existing_instructions>
-{existing_auto if existing_auto else "(none yet)"}
-</existing_instructions>
+Here are the existing .claude/rules/ files:
+<existing_rules>
+{rules_summary}
+
+Detailed content:
+{rules_detail if rules_detail.strip() else "(no rules files yet)"}
+</existing_rules>
 
 Here is the existing context file ({context_file_name}):
 <existing_context>
@@ -455,19 +514,26 @@ Here is the existing context file ({context_file_name}):
 </existing_context>
 
 Analyze the transcript. Produce incremental updates.
-If nothing new was discussed, return empty additions/corrections/removals.
+If nothing new was discussed, return empty arrays.
 
 You MUST respond with ONLY a JSON object (no markdown fences, no extra text) with exactly these keys:
-- "claude_md": string — updated auto-extracted instructions (full replacement, as before)
-- "primary_folder": string — the subfolder name where most work happened (e.g., "DB"), or "" for root
-- "additions": string — new markdown content to append (with ## headers), or "" if nothing new
-- "corrections": array of objects {{"find": "exact old text", "replace": "new text"}}, or []
-- "removals": array of strings (exact lines to remove from existing context), or []
-- "relevance_notes": string — what you checked for staleness
-- "summary": string — 1-2 sentence summary of changes
+
+- "rules": array of objects, each with:
+    - "file": string — kebab-case filename without extension (e.g., "pgm", "gws", "vis-analysis")
+    - "description": string — one-line description for YAML frontmatter
+    - "path_scope": array of glob strings (e.g., ["Trashformers/**"]), or [] for global
+    - "instructions": string — FULL content of the rules file (all instruction lines, not just new ones)
+  Return [] if no new instructions.
+
+- "primary_folder": string — subfolder where most work happened, or "" for root
+- "additions": string — new markdown for context file, or ""
+- "corrections": array of {{"find": "exact old text", "replace": "new text"}}, or []
+- "removals": array of strings, or []
+- "relevance_notes": string
+- "summary": string — 1-2 sentence summary
 
 Example:
-{{"claude_md": "- Always use X\\n- Never do Y", "primary_folder": "DB", "additions": "## New Section\\n- New fact discovered", "corrections": [{{"find": "old wrong fact", "replace": "corrected fact"}}], "removals": ["completely outdated line"], "relevance_notes": "Checked DB connection details — still accurate", "summary": "Added 1 fact about X, corrected Y"}}"""
+{{"rules": [{{"file": "vis-analysis", "description": "VIS print inspection analysis rules", "path_scope": ["VISAnanlysis/**"], "instructions": "- When classifying VIS failures, distinguish warp from missing print\\n- Floor stop rules: same track fails 2+ consecutive rows = STOP"}}], "primary_folder": "VISAnanlysis", "additions": "", "corrections": [], "removals": [], "relevance_notes": "Checked existing rules", "summary": "Added 2 VIS rules"}}"""
 
     try:
         result = subprocess.run(
@@ -514,15 +580,10 @@ Example:
             log(mem, f"claude -p result type unexpected: {type(content)}")
             return None
 
-        # Normalize claude_md to string
-        val = parsed.get("claude_md", "")
-        if isinstance(val, list):
-            parsed["claude_md"] = "\n".join(
-                f"- {item}" if not str(item).startswith("- ") else str(item)
-                for item in val
-            )
-        elif not isinstance(val, str):
-            parsed["claude_md"] = str(val) if val else ""
+        # Normalize rules to list
+        val = parsed.get("rules", [])
+        if not isinstance(val, list):
+            parsed["rules"] = []
 
         # Normalize additions to string
         val = parsed.get("additions", "")
@@ -617,7 +678,6 @@ def main():
         existing_context = read_file(context_path)
 
         # If no existing context at detected folder, check for legacy context.md
-        # at root and mention it so the LLM knows what exists
         legacy_context_path = project_dir / "context.md"
         legacy_context = ""
         if not existing_context and legacy_context_path.exists() and detected_folder:
@@ -625,20 +685,17 @@ def main():
             if legacy_context:
                 log(mem, f"Found legacy context.md at root, will consider it")
 
-        # Use the richer context for LLM input
         context_for_llm = existing_context or legacy_context
 
-        # CLAUDE.md — always at project root
-        claude_md_path = project_dir / "CLAUDE.md"
-        existing_claude = read_file(claude_md_path)
-        existing_auto = ""
-        if AUTO_MARKER in existing_claude:
-            existing_auto = existing_claude.split(AUTO_MARKER, 1)[1].strip()
+        # Read existing .claude/rules/ files
+        existing_rules = read_existing_rules(project_dir)
+        rules_summary = build_rules_summary(existing_rules)
+        log(mem, f"Found {len(existing_rules)} existing rules files")
 
-        # Call claude for incremental extraction
+        # Call claude for extraction
         result = call_claude(
-            transcript, existing_auto, context_for_llm,
-            context_file_name, mem
+            transcript, rules_summary, existing_rules,
+            context_for_llm, context_file_name, mem
         )
 
         if result is None:
@@ -646,15 +703,27 @@ def main():
             save_state(mem, session_id, message_count)
             return
 
-        # --- Apply CLAUDE.md changes (same as before) ---
-        new_auto = result.get("claude_md", "").strip()
-        if new_auto:
-            merged = merge_claude_md(existing_claude, new_auto)
-            atomic_write(claude_md_path, merged)
-            log(mem, "Updated CLAUDE.md auto-section")
+        # --- Apply rules file changes ---
+        rules_updates = result.get("rules", [])
+        for rule in rules_updates:
+            if not isinstance(rule, dict):
+                continue
+            file_name = rule.get("file", "").strip()
+            if not file_name:
+                continue
+            # Sanitize filename
+            file_name = re.sub(r'[^a-z0-9\-]', '-', file_name.lower())
+            description = rule.get("description", "").strip()
+            path_scope = rule.get("path_scope", [])
+            instructions = rule.get("instructions", "").strip()
+            if not instructions:
+                continue
+            if not isinstance(path_scope, list):
+                path_scope = []
+            write_rules_file(project_dir, file_name, description, path_scope,
+                             instructions, mem)
 
         # --- Apply incremental context changes ---
-        # Let LLM override folder detection if it has a stronger signal
         llm_folder = result.get("primary_folder", "").strip()
         if llm_folder and llm_folder != detected_folder:
             candidate = project_dir / llm_folder
@@ -663,7 +732,6 @@ def main():
                 detected_folder = llm_folder
                 context_path = find_context_file(project_dir, detected_folder)
                 context_file_name = context_path.name
-                # Re-read context for this folder
                 existing_context = read_file(context_path)
 
         additions = result.get("additions", "").strip()
@@ -675,7 +743,6 @@ def main():
         has_changes = bool(additions or corrections or removals)
 
         if has_changes:
-            # Use the correct existing content for the target path
             base_content = read_file(context_path) if context_path.exists() else ""
             updated = apply_incremental_changes(base_content, additions, corrections, removals)
             atomic_write(context_path, updated)
@@ -694,9 +761,10 @@ def main():
         index_content = """# Project Memory Index
 
 Knowledge is automatically extracted from conversations and stored in:
-- **CLAUDE.md** (project root): Instructions, workflow rules, things to DO/AVOID
+- **.claude/rules/<topic>.md**: Scoped instructions with optional path filters
 - **Context-<Folder>.md** (in each active folder): Project facts, architecture, business logic
 
+Rules files are path-scoped (e.g., pgm.md only loads when working in ProgramManagement/).
 Context files are placed in the folder where work happened (e.g., Context-DB.md in DB/).
 Updates are incremental — only new facts are added, wrong facts corrected, stale facts removed.
 
